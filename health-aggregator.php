@@ -124,6 +124,34 @@ final class Env
 // Helpers
 // =============================================================================
 
+/**
+ * Read a request header robustly. Apache with mod_php and many FastCGI setups
+ * drop `Authorization` before it reaches $_SERVER unless CGIPassAuth is on, so
+ * check the redirected copy and the raw header list as well.
+ */
+function agg_request_header(string $name): string
+{
+    $key = 'HTTP_' . strtoupper(str_replace('-', '_', $name));
+    foreach ([$key, 'REDIRECT_' . $key] as $candidate) {
+        if (isset($_SERVER[$candidate]) && is_string($_SERVER[$candidate]) && $_SERVER[$candidate] !== '') {
+            return $_SERVER[$candidate];
+        }
+    }
+    foreach (['apache_request_headers', 'getallheaders'] as $fn) {
+        if (function_exists($fn)) {
+            $headers = @$fn();
+            if (is_array($headers)) {
+                foreach ($headers as $header => $value) {
+                    if (strcasecmp((string) $header, $name) === 0 && is_string($value)) {
+                        return $value;
+                    }
+                }
+            }
+        }
+    }
+    return '';
+}
+
 /** Never print a token, not even in an error message. */
 function agg_redact(string $url): string
 {
@@ -401,6 +429,7 @@ if (!$isCli) {
     header('Content-Type: ' . ($opt['json'] ? 'application/json' : 'text/plain') . '; charset=utf-8');
     header('Cache-Control: no-store, max-age=0');
     header('X-Robots-Tag: noindex, nofollow');
+    header('X-Health-Check: aggregator');
 
     $token = $env->str('AGGREGATOR_TOKEN');
     $allowed = $env->list('ALLOW_IPS');
@@ -408,13 +437,13 @@ if (!$isCli) {
     $ipOk = $allowed === [] || in_array($remote, $allowed, true);
 
     $provided = '';
-    foreach ([$_GET['token'] ?? null, $_SERVER['HTTP_X_HEALTH_TOKEN'] ?? null] as $candidate) {
+    foreach ([$_GET['token'] ?? null, agg_request_header('X-Health-Token')] as $candidate) {
         if (is_string($candidate) && $candidate !== '') {
             $provided = $candidate;
             break;
         }
     }
-    if ($provided === '' && preg_match('/^Bearer\s+(.+)$/i', (string) ($_SERVER['HTTP_AUTHORIZATION'] ?? ''), $m)) {
+    if ($provided === '' && preg_match('/^Bearer\s+(.+)$/i', agg_request_header('Authorization'), $m)) {
         $provided = trim($m[1]);
     }
 
@@ -426,9 +455,21 @@ if (!$isCli) {
         echo $opt['json'] ? json_encode(['status' => 'forbidden', 'message' => $why]) . "\n" : "Forbidden: $why\n";
         exit(1);
     }
-    if (!$ipOk || !hash_equals(hash('sha256', $token), hash('sha256', $provided))) {
+    // Distinguish the misconfiguration cases: a 403 with no explanation is
+    // painful to debug from a monitoring tool that only shows the status code.
+    if (!$ipOk) {
+        $why = "client IP $remote is not in ALLOW_IPS";
+    } elseif ($provided === '') {
+        $why = 'no token supplied — send ?token=..., an X-Health-Token header, or Authorization: Bearer';
+    } elseif (!hash_equals(hash('sha256', $token), hash('sha256', $provided))) {
+        $why = 'token mismatch';
+    } else {
+        $why = null;
+    }
+    if ($why !== null) {
         http_response_code(403);
-        echo $opt['json'] ? "{\"status\":\"forbidden\"}\n" : "Forbidden\n";
+        header('X-Health-Check: aggregator');
+        echo $opt['json'] ? json_encode(['status' => 'forbidden', 'message' => $why]) . "\n" : "Forbidden: $why\n";
         exit(1);
     }
 }

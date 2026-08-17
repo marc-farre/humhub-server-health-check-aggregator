@@ -1,8 +1,8 @@
-# HumHub Server health check aggregator
+# HumHub health check aggregator
 
-Calls the `health-check.php` endpoint (see https://github.com/marc-farre/humhub-server-health-check)
-of several HumHub instances in parallel and condenses everything into **one** result, so a single
-Uptime Kuma monitor covers the whole fleet instead of one entry per server.
+Calls the `health-check.php` endpoint of several HumHub instances in parallel and
+condenses everything into **one** result, so a single Uptime Kuma monitor covers
+the whole fleet instead of one entry per server.
 
 ```
 All server health checks passed
@@ -31,8 +31,9 @@ OK   instance-one             healthy (139ms)
 Put it on any one server (a monitoring box, or one of the HumHub servers):
 
 ```bash
-git clone git@github.com:marc-farre/humhub-server-health-check-aggregator.git
-cd /path/to/webroot/humhub-server-health-check-aggregator
+mkdir -p /path/to/webroot/health-aggregator
+cp health-aggregator.php .env.example .htaccess /path/to/webroot/health-aggregator/
+cd /path/to/webroot/health-aggregator
 cp .env.example .env
 chmod 600 .env                 # must stay readable by the PHP user
 openssl rand -hex 32           # paste into AGGREGATOR_TOKEN
@@ -59,23 +60,61 @@ so on as the fleet grows. Test it:
 
 ```bash
 php health-aggregator.php -v
-curl -s "https://monitor.example.org/humhub-server-health-check-aggregator/health-aggregator.php?token=…"
+curl -s "https://monitor.example.org/health-aggregator/health-aggregator.php?token=…"
 ```
 
 ## Uptime Kuma
 
-One HTTP(s) monitor:
+One monitor covers the fleet:
 
-- **URL**: `https://monitor.example.org/humhub-server-health-check-aggregator/health-aggregator.php?token=…`
-  (or send the token as `X-Health-Token` / `Authorization: Bearer`)
-- **Keyword monitor** on `All server health checks passed` — recommended, since
-  the alert body then contains the failing instances and their errors.
-- Or a plain **status code monitor**: `200` when everything passed, `503` when at
-  least one instance failed.
-- Set the Kuma request timeout **above** the aggregator's `TIMEOUT` (default 15 s).
+| Field | Value |
+|---|---|
+| Monitor Type | `HTTP(s) - Keyword` |
+| URL | `https://monitor.example.org/health-aggregator/health-aggregator.php?token=<AGGREGATOR_TOKEN>` |
+| Keyword | `All server health checks passed` |
+| Invert Keyword | off |
+| Method | `GET` |
+| Body / Body Encoding | leave empty (the encoding dropdown is irrelevant for GET) |
+| Accepted Status Codes | `200-299` |
+| Request Timeout | above the aggregator's `TIMEOUT` (default 15 s) |
+
+Putting the token in the URL is the simplest option. To keep it out of the URL
+field, leave it off and add a header under **HTTP Options → Headers**:
+
+```json
+{ "X-Health-Token": "<AGGREGATOR_TOKEN>" }
+```
+
+`Authorization: Bearer <token>` works too, though some servers strip that header
+before PHP sees it — if a Bearer token gives 403, use `X-Health-Token` instead.
 
 Instances that only have warnings still count as passed, so warnings do not page
 you. Set `FAIL_ON_WARNING=true` if you would rather be told.
+
+### Getting a 403?
+
+The response tells you which side refused, and why:
+
+```bash
+curl -i "https://monitor.example.org/health-aggregator/health-aggregator.php?token=…"
+```
+
+- **`Content-Type: text/plain` with an `X-Health-Check: aggregator` header** — the
+  script refused. The body names the reason: `no token supplied`, `token mismatch`,
+  `client IP … is not in ALLOW_IPS`, or `.env exists but is not readable by the
+  PHP user`.
+- **`Content-Type: text/html` and no `X-Health-Check` header** — the *web server*
+  refused, before PHP ran. Usual causes:
+  - the aggregator was dropped into the per-instance `health/` directory, whose
+    rules only permit `health-check.php` (the nginx snippet
+    `location ~ ^/health/(?!health-check\.php$) { deny all; }` returns exactly
+    403). Give the aggregator its own directory, or add its filename to the rule.
+  - an `.htaccess`/nginx rule denying the whole directory, or a WAF.
+
+If `ALLOW_IPS` is set and Uptime Kuma runs in Docker or behind a reverse proxy,
+the address PHP sees is the container gateway or proxy — not the Kuma host. Either
+add that address, or drop `ALLOW_IPS` and rely on the token. The body reports the
+IP it actually saw, so you can copy it from there.
 
 ## What counts as a failure
 
@@ -124,5 +163,5 @@ Exit codes: `0` = all passed, `1` = warnings only, `2` = at least one failure �
 so it also works as a cron job that mails you only when something is wrong:
 
 ```cron
-*/5 * * * * out=$(/path/to/php /path/to/humhub-server-health-check-aggregator/health-aggregator.php 2>&1) || echo "$out"
+*/5 * * * * out=$(/path/to/php /path/to/health-aggregator/health-aggregator.php 2>&1) || echo "$out"
 ```
