@@ -1,0 +1,57 @@
+# =============================================================================
+# Protection for the health check aggregator directory.
+#
+# health-aggregator.php stays reachable (it needs to be, for the monitor);
+# everything else here — above all .env, which holds AGGREGATOR_TOKEN and the
+# per-instance tokens — is denied.
+#
+# The aggregator directory is often not inside a HumHub installation, so no other
+# .htaccess is protecting it. This file is all there is.
+# =============================================================================
+
+# No directory listing.
+Options -Indexes
+
+# Never let the server hand out anything but the script itself.
+<IfModule mod_authz_core.c>
+    # Apache 2.4+
+    <FilesMatch "^\.">
+        Require all denied
+    </FilesMatch>
+    <FilesMatch "\.(env|example|dist|md|json|log|bak|old|ini|yml|yaml|txt|sh)$">
+        Require all denied
+    </FilesMatch>
+</IfModule>
+
+<IfModule !mod_authz_core.c>
+    # Apache 2.2
+    <FilesMatch "^\.">
+        Order allow,deny
+        Deny from all
+    </FilesMatch>
+    <FilesMatch "\.(env|example|dist|md|json|log|bak|old|ini|yml|yaml|txt|sh)$">
+        Order allow,deny
+        Deny from all
+    </FilesMatch>
+</IfModule>
+
+# Belt and braces: if mod_rewrite is available, 404 anything that is not the
+# health check entry point.
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteCond %{REQUEST_FILENAME} -f
+    RewriteRule !^health-aggregator\.php$ - [R=404,L]
+</IfModule>
+
+# --- Optional: restrict by IP as well ----------------------------------------
+# Uncomment and list your Uptime Kuma host(s). AGGREGATOR_TOKEN still applies.
+#<Files "health-aggregator.php">
+#    <IfModule mod_authz_core.c>
+#        Require ip 203.0.113.10
+#    </IfModule>
+#    <IfModule !mod_authz_core.c>
+#        Order deny,allow
+#        Deny from all
+#        Allow from 203.0.113.10
+#    </IfModule>
+#</Files>
