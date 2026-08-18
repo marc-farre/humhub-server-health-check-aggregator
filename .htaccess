@@ -1,20 +1,21 @@
 # =============================================================================
 # Protection for the health check aggregator directory.
 #
-# health-aggregator.php stays reachable (it needs to be, for the monitor);
-# everything else here — above all .env, which holds AGGREGATOR_TOKEN and the
-# per-instance tokens — is denied.
+# health-aggregator.php stays reachable (the monitor needs it); everything else
+# here — above all .env, which holds AGGREGATOR_TOKEN and the per-instance tokens — is denied.
 #
-# The aggregator directory is often not inside a HumHub installation, so no other
-# .htaccess is protecting it. This file is all there is.
+# The aggregator directory is often not inside a HumHub installation, so no
+# other .htaccess is protecting it. This file is all there is.
 # =============================================================================
 
 # No directory listing.
 Options -Indexes
 
-# Never let the server hand out anything but the script itself.
-<IfModule mod_authz_core.c>
-    # Apache 2.4+
+# --- Deny the configuration and every other non-script file ------------------
+# Uses Apache 2.4 authz first, with a 2.2 fallback. Both module spellings are
+# accepted by Apache; `authz_core_module` is the form HumHub's own .htaccess
+# uses, so it is known to work wherever HumHub does.
+<IfModule authz_core_module>
     <FilesMatch "^\.">
         Require all denied
     </FilesMatch>
@@ -23,8 +24,7 @@ Options -Indexes
     </FilesMatch>
 </IfModule>
 
-<IfModule !mod_authz_core.c>
-    # Apache 2.2
+<IfModule !authz_core_module>
     <FilesMatch "^\.">
         Order allow,deny
         Deny from all
@@ -35,21 +35,36 @@ Options -Indexes
     </FilesMatch>
 </IfModule>
 
-# Belt and braces: if mod_rewrite is available, 404 anything that is not the
-# health check entry point.
-<IfModule mod_rewrite.c>
-    RewriteEngine On
-    RewriteCond %{REQUEST_FILENAME} -f
-    RewriteRule !^health-aggregator\.php$ - [R=404,L]
-</IfModule>
+# --- Optional extra hardening: 404 anything except the script ----------------
+# DISABLED BY DEFAULT ON PURPOSE.
+#
+# A RewriteRule in a .htaccess requires Options FollowSymLinks (or
+# SymLinksIfOwnerMatch) to be granted for this directory. Many shared and
+# managed hosts do not grant it, and when it is missing Apache refuses EVERY
+# request in the directory with:
+#
+#   403 Forbidden — "You don't have permission to access the requested object."
+#   error log: AH00670: Options FollowSymLinks and SymLinksIfOwnerMatch are both
+#              off, so the RewriteRule directive is also forbidden
+#
+# The FilesMatch rules above already protect the .env without needing rewrites,
+# so only enable this if you have verified it works on your host. Keep the
+# Options line: it is what makes the RewriteRule permissible.
+#
+#<IfModule mod_rewrite.c>
+#    Options +FollowSymLinks
+#    RewriteEngine On
+#    RewriteCond %{REQUEST_FILENAME} -f
+#    RewriteRule !^health-aggregator\.php$ - [R=404,L]
+#</IfModule>
 
 # --- Optional: restrict by IP as well ----------------------------------------
-# Uncomment and list your Uptime Kuma host(s). AGGREGATOR_TOKEN still applies.
+# Uncomment and list your Uptime Kuma host(s). AGGREGATOR_TOKEN and the per-instance tokens still applies.
 #<Files "health-aggregator.php">
-#    <IfModule mod_authz_core.c>
+#    <IfModule authz_core_module>
 #        Require ip 203.0.113.10
 #    </IfModule>
-#    <IfModule !mod_authz_core.c>
+#    <IfModule !authz_core_module>
 #        Order deny,allow
 #        Deny from all
 #        Allow from 203.0.113.10

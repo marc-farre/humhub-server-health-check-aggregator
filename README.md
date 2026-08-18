@@ -109,6 +109,10 @@ curl -i "https://monitor.example.org/health-aggregator/health-aggregator.php?tok
     rules only permit `health-check.php` (the nginx snippet
     `location ~ ^/health/(?!health-check\.php$) { deny all; }` returns exactly
     403). Give the aggregator its own directory, or add its filename to the rule.
+  - an `.htaccess` `RewriteRule` that Apache refuses because
+    `Options FollowSymLinks` is not granted for the directory — the error log
+    shows `AH00670`. The shipped `.htaccess` avoids rewrites entirely for this
+    reason; if you enabled the optional block, comment it out again.
   - an `.htaccess`/nginx rule denying the whole directory, or a WAF.
 
 If `ALLOW_IPS` is set and Uptime Kuma runs in Docker or behind a reverse proxy,
