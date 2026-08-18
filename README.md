@@ -152,9 +152,24 @@ no monitor.
 - **Fail closed**: without `AGGREGATOR_TOKEN` the endpoint refuses every HTTP
   request. It exposes the health of the entire fleet at once, so it needs at least
   as much protection as the individual endpoints.
-- `MAX_DETAIL_LINES` (default 10) caps the lines printed per instance so one very
-  broken server cannot bury the others in the alert; the full report stays one
-  click away at the instance URL.
+- **Warnings come with their detail.** Every instance that reported warnings gets
+  them listed, along with the remote's advice line, in the same format the
+  per-instance script uses:
+
+  ```
+  WARN demo.example.org        healthy, 2 warning(s) (356ms)
+       WARNING [php_settings] display_errors is On for the web SAPI.
+               -> Leaks paths and stack traces to visitors — turn it off in production.
+       WARNING [opcache] OPcache pressure: cache_full=yes, … 100.0% used of 256.00 MB.
+               -> Increase opcache.memory_consumption / opcache.max_accelerated_files.
+  ```
+
+  `SHOW_WARNINGS=false` reduces this to errors only, `SHOW_HINTS=false` drops the
+  `->` lines. Works whether the instance answers in plain text or JSON.
+- `MAX_DETAIL_LINES` (default 20) caps the entries printed per instance so one
+  very broken server cannot bury the others in the alert; the remainder is
+  summarised as "… and N more" and the full report stays one click away at the
+  instance URL.
 
 ## CLI
 

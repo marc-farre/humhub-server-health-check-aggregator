@@ -313,11 +313,14 @@ function agg_classify(array $res): array
             $errors = [];
             $warnings = [];
             foreach ($json['checks'] ?? [] as $check) {
-                $line = ($check['check'] ?? '?') . ': ' . ($check['message'] ?? '');
+                $entry = [
+                    'message' => '[' . ($check['check'] ?? '?') . '] ' . ($check['message'] ?? ''),
+                    'hint' => isset($check['hint']) && $check['hint'] !== null ? (string) $check['hint'] : null,
+                ];
                 if (($check['state'] ?? '') === 'ERROR') {
-                    $errors[] = $line;
+                    $errors[] = $entry;
                 } elseif (($check['state'] ?? '') === 'WARNING') {
-                    $warnings[] = $line;
+                    $warnings[] = $entry;
                 }
             }
             $status = (string) ($json['status'] ?? '');
@@ -337,12 +340,31 @@ function agg_classify(array $res): array
         $lines = preg_split('/\R/', $body) ?: [];
         $errors = [];
         $warnings = [];
+        $lastList = null;   // 'e' or 'w': which list the previous entry went into
+        $lastIndex = -1;
         foreach ($lines as $line) {
-            $line = trim($line);
-            if (str_starts_with($line, 'ERROR')) {
-                $errors[] = ltrim(substr($line, 5), ' :');
-            } elseif (str_starts_with($line, 'WARNING')) {
-                $warnings[] = ltrim(substr($line, 7), ' :');
+            $trimmed = trim($line);
+
+            // health-check.php prints its advice on an indented continuation line
+            // ("        -> do this"); attach it to the entry above it.
+            if ($lastList !== null && preg_match('/^->\s*(.+)$/', $trimmed, $hm)) {
+                if ($lastList === 'e') {
+                    $errors[$lastIndex]['hint'] = trim($hm[1]);
+                } else {
+                    $warnings[$lastIndex]['hint'] = trim($hm[1]);
+                }
+                continue;
+            }
+            if (str_starts_with($trimmed, 'ERROR')) {
+                $errors[] = ['message' => ltrim(substr($trimmed, 5), ' :'), 'hint' => null];
+                $lastList = 'e';
+                $lastIndex = count($errors) - 1;
+            } elseif (str_starts_with($trimmed, 'WARNING')) {
+                $warnings[] = ['message' => ltrim(substr($trimmed, 7), ' :'), 'hint' => null];
+                $lastList = 'w';
+                $lastIndex = count($warnings) - 1;
+            } elseif ($trimmed === '') {
+                $lastList = null;
             }
         }
         // Prefer the counts from the remote headline: the body may have been
@@ -580,8 +602,9 @@ printf(
     $duration
 );
 
-$maxDetail = $env->int('MAX_DETAIL_LINES', 10);
+$maxDetail = $env->int('MAX_DETAIL_LINES', 20);
 $showWarnings = $env->bool('SHOW_WARNINGS', true);
+$showHints = $env->bool('SHOW_HINTS', true);
 
 // Failures first — that is what the person reading the alert needs.
 usort($results, static function (array $a, array $b): int {
@@ -602,21 +625,26 @@ foreach ($results as $r) {
         printf("     %s\n", $r['url']);
     }
 
+    // Errors always; warnings whenever the instance reported any, so a WARN
+    // instance is as actionable in the alert as a failing one.
     $detail = [];
-    foreach ($r['errors'] as $line) {
-        $detail[] = 'ERROR: ' . $line;
+    foreach ($r['errors'] as $entry) {
+        $detail[] = ['level' => 'ERROR', 'message' => $entry['message'], 'hint' => $entry['hint']];
     }
-    if ($showWarnings && (in_array($r['state'], ['FAIL', 'DOWN'], true) || $opt['verbose'])) {
-        foreach ($r['warnings'] as $line) {
-            $detail[] = 'WARNING: ' . $line;
+    if ($showWarnings) {
+        foreach ($r['warnings'] as $entry) {
+            $detail[] = ['level' => 'WARNING', 'message' => $entry['message'], 'hint' => $entry['hint']];
         }
     }
     $shown = array_slice($detail, 0, $maxDetail);
-    foreach ($shown as $line) {
-        printf("     - %s\n", $line);
+    foreach ($shown as $entry) {
+        printf("     %s %s\n", $paint(str_pad($entry['level'], 7), $entry['level'] === 'ERROR' ? 'FAIL' : 'WARN'), $entry['message']);
+        if ($showHints && $entry['hint'] !== null && $entry['hint'] !== '') {
+            printf("             -> %s\n", $entry['hint']);
+        }
     }
     if (count($detail) > count($shown)) {
-        printf("     - … and %d more (open %s for the full report)\n", count($detail) - count($shown), $r['url']);
+        printf("     … and %d more (open %s for the full report)\n", count($detail) - count($shown), $r['url']);
     }
 }
 
