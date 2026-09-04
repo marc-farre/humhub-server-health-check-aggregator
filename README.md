@@ -8,8 +8,8 @@ the whole fleet instead of one entry per server.
 All server health checks passed
 2 instance(s): 2 ok, 0 with warnings, 0 failed | 0.31s
 
-OK   instance-one             healthy (142ms)
-OK   instance-two             healthy (168ms)
+OK   one.example.org          healthy (142ms)
+OK   two.example.org          healthy (168ms)
 ```
 
 When something breaks, the phrase is **absent** and the failing instances come
@@ -19,11 +19,11 @@ first, with their errors inline:
 1 of 2 server health check(s) FAILED
 2 instance(s): 1 ok, 0 with warnings, 1 failed | 0.28s
 
-FAIL instance-two             2 error(s), 4 warning(s) (151ms)
+FAIL two.example.org          2 error(s), 4 warning(s) (151ms)
      https://two.example.org/humhub-server-health-check/health-check.php
-     - ERROR: [humhub_permissions] HumHub directories are not writable: uploads/file …
+     - ERROR: [app_permissions] HumHub directories are not writable: uploads/file …
      - ERROR: [cron] Cron uses PHP 8.1 (/opt/php8.1/bin/php, cron/run) but the web …
-OK   instance-one             healthy (139ms)
+OK   one.example.org          healthy (139ms)
 ```
 
 ## Install
@@ -44,16 +44,21 @@ Then list the instances in `.env`:
 ```ini
 AGGREGATOR_TOKEN=<the token you just generated>
 
-# If every instance was deployed with the same HEALTH_TOKEN, set it once:
-DEFAULT_TOKEN=<the per-instance HEALTH_TOKEN>
+# If every instance was deployed with the same TOKEN, set it once:
+DEFAULT_TOKEN=<the per-instance TOKEN>
 
-TARGET_1_LABEL=instance-one
 TARGET_1_URL=https://one.example.org/humhub-server-health-check/health-check.php
 
-TARGET_2_LABEL=instance-two
 TARGET_2_URL=https://two.example.org/humhub-server-health-check/health-check.php
 TARGET_2_TOKEN=<a different token, if this instance has one>
 ```
+
+A URL is all an instance needs: it is named after the host in it, so those two
+appear everywhere as `one.example.org` and `two.example.org`. Set
+`TARGET_n_LABEL` only to override that — for example when several instances
+share a host, where the host name alone would not tell them apart. (Derived
+names are always made unique: a repeated host is qualified by its port, then by
+the path the instance lives under.)
 
 Numbering runs from 1 upwards without gaps — add `TARGET_3_*`, `TARGET_4_*` and
 so on as the fleet grows. Test it:
@@ -162,7 +167,7 @@ warning. Instances slower than `SLOW_MS` (default 5000) are marked in both the
 output and the log:
 
 ```
-OK   instance-two             healthy (4001ms, slow)
+OK   two.example.org          healthy (4001ms, slow)
 ```
 
 Transport failures are retried `RETRIES` times (default `1`) before an instance

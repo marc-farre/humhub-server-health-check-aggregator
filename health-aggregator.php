@@ -134,20 +134,6 @@ final class Env
 // =============================================================================
 
 /**
- * An append-only log of what the aggregator saw.
- *
- * The aggregator normally runs from a monitor, where the response body is the
- * only thing anyone sees and only for as long as the monitor keeps it. Anything
- * worth explaining after the fact — a failing instance, an instance that came
- * back, a slow one, a PHP error, a broken configuration — is therefore also
- * appended here, and can be read back over HTTP with `?log=`.
- *
- * The file is written next to the script by default, where the bundled
- * .htaccess already denies `.log`. If that directory is not writable by the PHP
- * user (a very common split between the CLI and web users), the temp directory
- * is used instead and the fallback is reported rather than silently swallowed.
- */
-/**
  * Where to put a file when the script's own directory is not writable.
  *
  * The name is tied to the installation directory and the user, so two
@@ -182,12 +168,26 @@ function agg_fallback_path(string $name): string
     return $dir === '' ? '' : $dir . '/' . $name;
 }
 
+/**
+ * An append-only log of what the aggregator saw.
+ *
+ * The aggregator normally runs from a monitor, where the response body is the
+ * only thing anyone sees and only for as long as the monitor keeps it. Anything
+ * worth explaining after the fact — a failing instance, an instance that came
+ * back, a slow one, a PHP error, a broken configuration — is therefore also
+ * appended here, and can be read back over HTTP with `?log=`.
+ *
+ * The file is written next to the script by default, where the bundled
+ * .htaccess already denies `.log`. If that directory is not writable by the PHP
+ * user (a very common split between the CLI and web users), the temp directory
+ * is used instead and the fallback is reported rather than silently swallowed.
+ */
 final class AggLog
 {
     public const OFF = 'off';
 
     private string $file;
-    private string $fallback;
+    private string $fallback = '';
     private string $format;
     private string $events;
     private int $maxBytes;
@@ -201,7 +201,6 @@ final class AggLog
     {
         $this->enabled = $env->bool('LOG_ENABLED', true);
         $this->file = $env->str('LOG_FILE', rtrim($dir, '/') . '/health-aggregator.log');
-        $this->fallback = agg_fallback_path('health-aggregator.log');
         $this->format = strtolower($env->str('LOG_FORMAT', 'text')) === 'json' ? 'json' : 'text';
         $this->events = strtolower($env->str('LOG_EVENTS', 'changes'));
         if (!in_array($this->events, ['off', 'problems', 'changes', 'all'], true)) {
@@ -303,24 +302,36 @@ final class AggLog
             return $this->file;
         }
         $this->opened = true;
-        foreach ([$this->file, $this->fallback] as $candidate) {
-            if ($candidate === '') {
-                continue;
-            }
-            $handle = @fopen($candidate, 'ab');
-            if ($handle !== false) {
-                fclose($handle);
-                if ($candidate !== $this->file) {
-                    $this->problem = sprintf('%s is not writable by the PHP user — logging to %s instead', $this->file, $candidate);
-                    $this->file = $candidate;
-                }
-                @chmod($this->file, 0640);
-                return $this->file;
-            }
+        if ($this->open($this->file)) {
+            return $this->file;
         }
-        $this->problem = sprintf('neither %s nor %s is writable by the PHP user — nothing is being logged', $this->file, $this->fallback);
+        // Only now is the fallback worth having: obtaining it creates a directory,
+        // and a working local log should leave no trace anywhere else.
+        $this->fallback = agg_fallback_path('health-aggregator.log');
+        if ($this->fallback !== '' && $this->open($this->fallback)) {
+            $this->problem = sprintf('%s is not writable by the PHP user — logging to %s instead', $this->file, $this->fallback);
+            $this->file = $this->fallback;
+            return $this->file;
+        }
+        $this->problem = sprintf(
+            '%s is not writable by the PHP user%s — nothing is being logged',
+            $this->file,
+            $this->fallback !== '' ? ', nor is ' . $this->fallback : ' and no usable fallback directory could be created'
+        );
         $this->enabled = false;
         return null;
+    }
+
+    /** Can this path be appended to? Creates it, with the log's own mode. */
+    private function open(string $path): bool
+    {
+        $handle = @fopen($path, 'ab');
+        if ($handle === false) {
+            return false;
+        }
+        fclose($handle);
+        @chmod($path, 0640);
+        return true;
     }
 
     private function append(string $entry): void
@@ -382,18 +393,19 @@ final class AggState
         $data = null;
         if (is_readable($this->file)) {
             $data = json_decode((string) @file_get_contents($this->file), true);
-        } else {
-            // Not there, or there but written by the other user — a cron run as
-            // root and a web run as www-data is the common split. Either way this
-            // process cannot use it, so it uses its own copy; reading the primary
-            // and writing the fallback would reset the change detection on every
-            // single poll.
+        } elseif (file_exists($this->file)) {
+            // There, but written by the other user — a cron run as root and a web
+            // run as www-data is the common split. This process cannot read it,
+            // so it keeps its own copy: reading the primary and writing somewhere
+            // else would reset the change detection on every single poll.
             $fallback = agg_fallback_path('health-aggregator-state.json');
             if ($fallback !== '') {
                 $this->file = $fallback;
                 $data = is_readable($fallback) ? json_decode((string) @file_get_contents($fallback), true) : null;
             }
         }
+        // Simply not there yet is the first run: keep the configured path and let
+        // save() create it, which falls back on its own if the write fails.
         $this->data = is_array($data) ? $data : [];
     }
 
@@ -481,16 +493,19 @@ function agg_targets(Env $env): array
     $defaultToken = $env->str('DEFAULT_TOKEN');
     $max = $env->int('MAX_TARGETS', 100);
     $timeout = $env->int('TIMEOUT', 15);
+    $used = [];
 
     for ($i = 1; $i <= $max; $i++) {
         $url = trim($env->str("TARGET_{$i}_URL"));
         if ($url === '') {
             continue;
         }
+        // A URL is all a target needs: the host in it names the instance.
         $label = $env->str("TARGET_{$i}_LABEL");
         if ($label === '') {
-            $label = (string) (parse_url($url, PHP_URL_HOST) ?: "target$i");
+            $label = agg_derive_label($url, $used, $i);
         }
+        $used[strtolower($label)] = true;
         $targets[] = [
             'label' => $label,
             'url' => $url,
@@ -504,6 +519,47 @@ function agg_targets(Env $env): array
     }
 
     return $targets;
+}
+
+/**
+ * Name an instance after the host in its URL.
+ *
+ * The label is the instance's identity everywhere it matters — the output, the
+ * log, the change-detection state, `--only` — so two instances must never end up
+ * sharing one. Several HumHub sites behind a single host is an ordinary setup, so
+ * when the host is already taken the path they live under is what tells them
+ * apart: `example.org/site-a`, `example.org/site-b`.
+ *
+ * @param array<string,bool> $used labels already assigned, lower-cased
+ */
+function agg_derive_label(string $url, array $used, int $index): string
+{
+    $host = (string) (parse_url($url, PHP_URL_HOST) ?: '');
+    if ($host === '') {
+        return "target$index";
+    }
+    if (!isset($used[strtolower($host)])) {
+        return $host;
+    }
+    // Same host on a different port is a whole different instance, and the port
+    // says so far more usefully than any suffix we could invent.
+    $port = parse_url($url, PHP_URL_PORT);
+    if (is_int($port) && !isset($used[strtolower($host . ':' . $port)])) {
+        return $host . ':' . $port;
+    }
+    $segments = array_values(array_filter(explode('/', trim((string) (parse_url($url, PHP_URL_PATH) ?: ''), '/'))));
+    array_pop($segments); // health-check.php itself says nothing about which site it is
+    // Outermost segment first: the health check normally sits in a subdirectory
+    // of the site it belongs to, so "/site-a/health/" is named by "site-a", not
+    // by the "health" directory every one of them has.
+    foreach ($segments as $segment) {
+        $candidate = $host . '/' . $segment;
+        if (!isset($used[strtolower($candidate)])) {
+            return $candidate;
+        }
+    }
+    // Same host, same path, twice over: fall back to something merely unique.
+    return $host . '-' . $index;
 }
 
 /**
