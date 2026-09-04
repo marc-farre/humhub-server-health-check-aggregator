@@ -45,23 +45,38 @@ Then list the instances in `.env`:
 AGGREGATOR_TOKEN=<the token you just generated>
 
 # If every instance was deployed with the same TOKEN, set it once:
-DEFAULT_TOKEN=<the per-instance TOKEN>
+TARGET_TOKEN=<the per-instance TOKEN>
 
-TARGET_1_URL=https://one.example.org/humhub-server-health-check/health-check.php
-
-TARGET_2_URL=https://two.example.org/humhub-server-health-check/health-check.php
-TARGET_2_TOKEN=<a different token, if this instance has one>
+TARGET_URL[]=https://one.example.org/humhub-server-health-check/health-check.php
+TARGET_URL[]=https://two.example.org/humhub-server-health-check/health-check.php?token=<a different token, if this instance has one>
 ```
 
-A URL is all an instance needs: it is named after the host in it, so those two
-appear everywhere as `one.example.org` and `two.example.org`. Set
-`TARGET_n_LABEL` only to override that — for example when several instances
-share a host, where the host name alone would not tell them apart. (Derived
-names are always made unique: a repeated host is qualified by its port, then by
-the path the instance lives under.)
+One `TARGET_URL[]` line per instance, in any order — adding a server to the
+fleet is one line, with nothing to renumber. A URL is all an instance needs: it
+is named after the host in it, so those two appear everywhere as
+`one.example.org` and `two.example.org`. (Derived names are always made unique:
+a repeated host is qualified by its port, then by the path the instance lives
+under.)
 
-Numbering runs from 1 upwards without gaps — add `TARGET_3_*`, `TARGET_4_*` and
-so on as the fleet grows. Test it:
+Anything else one instance needs follows its URL after a `|`:
+
+| Setting | Overrides |
+| --- | --- |
+| `token` | that instance's own token, when it differs from `TARGET_TOKEN`. Sent as an `X-Health-Token` header, so it stays out of the target's access log; a `?token=…` in the URL is used as given instead, which keeps the URL one you can paste into a browser |
+| `label` | the derived name, for when several instances share a host and the host name alone would not tell them apart: `\|label=intranet (staging)` |
+| `insecure` | TLS verification, skipping it (self-signed staging certificates only) |
+| `host_header` | the `Host` header, for checking an instance by IP |
+| `timeout` | `TIMEOUT`, for one habitually slow instance |
+
+A setting with no value is on, so `|insecure` means `|insecure=true`.
+
+Where a `.env` is not an option — a container configured through the
+environment, which cannot give the same variable twice — pass the whole list as
+one comma-separated `TARGET_URL`, `|` settings included. The numbered
+`TARGET_n_URL` / `TARGET_n_TOKEN` / `TARGET_n_LABEL` … form also still works and
+may be mixed in, numbered from 1 without gaps up to `MAX_TARGETS` (100).
+
+Test it:
 
 ```bash
 php health-aggregator.php -v
@@ -174,8 +189,8 @@ Transport failures are retried `RETRIES` times (default `1`) before an instance
 is called down, so a single dropped connection does not page you. Only failures
 to *answer* are retried — an instance that reported errors reported them. Worst
 case the run takes `TIMEOUT × (RETRIES + 1)`, so keep the Uptime Kuma request
-timeout above that. `TARGET_n_TIMEOUT` overrides `TIMEOUT` for one instance,
-which beats raising it for the whole fleet because of one slow server.
+timeout above that. A `|timeout=25` on one instance overrides `TIMEOUT` just
+for it, which beats raising it for the whole fleet because of one slow server.
 
 ### Getting a 403?
 
@@ -228,8 +243,8 @@ no monitor.
 - **Tokens are never printed.** Instance URLs are redacted (`token=***`) in every
   output mode, including JSON, so a public Kuma status page cannot leak them. By
   default the token is sent as an `X-Health-Token` header rather than in the URL,
-  keeping it out of the target's access log; if `TARGET_n_URL` already contains
-  `?token=`, it is used as given.
+  keeping it out of the target's access log; if a configured URL already carries a
+  non-empty `?token=`, that is used as given instead.
 - **The keyword is unambiguous.** Per-instance lines are written in the
   aggregator's own words (`healthy`, `2 error(s), 4 warning(s)`) and never repeat
   the remote `Server health check passed` phrase — otherwise a keyword monitor

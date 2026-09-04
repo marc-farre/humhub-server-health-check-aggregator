@@ -55,6 +55,8 @@ final class Env
 {
     /** @var array<string,string> */
     private array $vars = [];
+    /** @var array<string,string[]> values from repeated `KEY[]=` lines, in file order */
+    private array $lists = [];
     private ?string $file = null;
 
     public function load(string $file): bool
@@ -81,6 +83,15 @@ final class Env
                 $val = substr($val, 1, -1);
             } elseif (($hash = strpos($val, ' #')) !== false) {
                 $val = rtrim(substr($val, 0, $hash));
+            }
+            // `KEY[]=` repeated on several lines is a list, so that the targets
+            // can be written one per line instead of being numbered by hand.
+            // Plain `KEY=` stays last-one-wins, as every .env does.
+            if (str_ends_with($key, '[]')) {
+                if ($val !== '') {
+                    $this->lists[substr($key, 0, -2)][] = $val;
+                }
+                continue;
             }
             $this->vars[$key] = $val;
         }
@@ -115,7 +126,12 @@ final class Env
         if ($v === null || $v === '') {
             return $default;
         }
-        return in_array(strtolower($v), ['1', 'true', 'yes', 'on', 'enabled'], true);
+        return self::truthy($v);
+    }
+
+    public static function truthy(string $v): bool
+    {
+        return in_array(strtolower(trim($v)), ['1', 'true', 'yes', 'on', 'enabled'], true);
     }
 
     public function int(string $key, int $default): int
@@ -133,6 +149,31 @@ final class Env
         }
         $parts = preg_split('/[,\s]+/', trim($v)) ?: [];
         return array_values(array_filter(array_map('trim', $parts), static fn($p) => $p !== ''));
+    }
+
+    /**
+     * The repeated `KEY[]=` lines, followed by a comma-separated plain `KEY`.
+     *
+     * A real environment variable cannot be given twice, so a container that has
+     * no .env to write `[]` lines into can pass the same list as one
+     * comma-separated `KEY`. Both forms are read, and add up.
+     *
+     * Only commas and newlines separate entries here, never spaces: an entry
+     * carries inline options after a `|`, and splitting on spaces would tear
+     * `url | token=x` into three unusable pieces instead of one entry.
+     *
+     * @return string[]
+     */
+    public function items(string $key): array
+    {
+        $items = $this->lists[$key] ?? [];
+        $flat = $this->raw($key);
+        if ($flat !== null && trim($flat) !== '') {
+            foreach (preg_split('/[,\r\n]+/', $flat) ?: [] as $part) {
+                $items[] = $part;
+            }
+        }
+        return array_values(array_filter(array_map('trim', $items), static fn($p) => $p !== ''));
     }
 }
 
@@ -512,43 +553,104 @@ function agg_redact(string $url): string
     return $url;
 }
 
+/** The per-target settings an entry may carry, whether inline or numbered. */
+const AGG_TARGET_OPTIONS = ['token', 'label', 'insecure', 'host_header', 'timeout'];
+
 /**
- * Read the numbered TARGET_n_* blocks from the .env.
+ * Read the targets: the `TARGET_URL[]` list first, then the numbered
+ * `TARGET_n_*` blocks, both of which may be used in the same .env.
  *
  * @return array<int,array{label:string,url:string,token:string,insecure:bool,host_header:string,timeout:int}>
  */
 function agg_targets(Env $env): array
 {
-    $targets = [];
-    $defaultToken = $env->str('DEFAULT_TOKEN');
-    $max = $env->int('MAX_TARGETS', 100);
     $timeout = $env->int('TIMEOUT', 15);
-    $used = [];
+    // TARGET_* is the name every other per-target setting uses; DEFAULT_* is the
+    // older name for these two and keeps working.
+    $defaults = [
+        'token' => $env->str('TARGET_TOKEN', $env->str('DEFAULT_TOKEN')),
+        'insecure' => $env->bool('TARGET_INSECURE', $env->bool('DEFAULT_INSECURE', false)) ? 'true' : 'false',
+        'label' => '',
+        'host_header' => '',
+        'timeout' => (string) $timeout,
+    ];
 
+    /** @var array<int,array<string,string>> url plus whichever options are set, in configured order */
+    $entries = [];
+    foreach ($env->items('TARGET_URL') as $entry) {
+        $parsed = agg_parse_target($entry);
+        if ($parsed !== null) {
+            $entries[] = $parsed;
+        }
+    }
+    $max = $env->int('MAX_TARGETS', 100);
     for ($i = 1; $i <= $max; $i++) {
         $url = trim($env->str("TARGET_{$i}_URL"));
         if ($url === '') {
             continue;
         }
-        // A URL is all a target needs: the host in it names the instance.
-        $label = $env->str("TARGET_{$i}_LABEL");
-        if ($label === '') {
-            $label = agg_derive_label($url, $used, $i);
+        $entry = ['url' => $url];
+        foreach (AGG_TARGET_OPTIONS as $name) {
+            $v = $env->raw("TARGET_{$i}_" . strtoupper($name));
+            if ($v !== null && trim($v) !== '') {
+                $entry[$name] = trim($v);
+            }
         }
+        $entries[] = $entry;
+    }
+
+    $targets = [];
+    $used = [];
+    foreach ($entries as $index => $entry) {
+        $entry += $defaults;
+        // A URL is all a target needs: the host in it names the instance.
+        $label = $entry['label'] !== '' ? $entry['label'] : agg_derive_label($entry['url'], $used, $index + 1);
         $used[strtolower($label)] = true;
         $targets[] = [
             'label' => $label,
-            'url' => $url,
-            'token' => $env->str("TARGET_{$i}_TOKEN", $defaultToken),
-            'insecure' => $env->bool("TARGET_{$i}_INSECURE", $env->bool('DEFAULT_INSECURE', false)),
-            'host_header' => $env->str("TARGET_{$i}_HOST_HEADER"),
+            'url' => $entry['url'],
+            'token' => $entry['token'],
+            'insecure' => Env::truthy($entry['insecure']),
+            'host_header' => $entry['host_header'],
             // One habitually slow instance should not force a longer timeout on
             // the whole fleet. 0 keeps cURL's meaning of "no timeout".
-            'timeout' => max(0, $env->int("TARGET_{$i}_TIMEOUT", $timeout)),
+            'timeout' => max(0, is_numeric($entry['timeout']) ? (int) $entry['timeout'] : $timeout),
         ];
     }
 
     return $targets;
+}
+
+/**
+ * One `TARGET_URL[]` entry: the URL, then any per-target settings after a `|`.
+ *
+ *   https://one.example.org/health-check.php|token=abc123|label=intranet (staging)
+ *
+ * A setting with no value is on — `|insecure` means `|insecure=true`. Anything
+ * that is not one of AGG_TARGET_OPTIONS is ignored rather than fatal: a typo in
+ * one instance's options must not take the whole fleet's monitoring down.
+ *
+ * @return array<string,string>|null the url and its options, or null for a blank entry
+ */
+function agg_parse_target(string $entry): ?array
+{
+    $parts = explode('|', $entry);
+    $url = trim((string) array_shift($parts));
+    if ($url === '') {
+        return null;
+    }
+    $parsed = ['url' => $url];
+    foreach ($parts as $part) {
+        $pos = strpos($part, '=');
+        // The value may itself contain '=' (a token never needs quoting).
+        $name = strtolower(trim($pos === false ? $part : substr($part, 0, $pos)));
+        $value = $pos === false ? 'true' : trim(substr($part, $pos + 1));
+        $name = str_replace('-', '_', $name);
+        if ($value !== '' && in_array($name, AGG_TARGET_OPTIONS, true)) {
+            $parsed[$name] = $value;
+        }
+    }
+    return $parsed;
 }
 
 /**
@@ -669,8 +771,11 @@ function agg_fetch_batch(array $targets, Env $env, array $indices): array
         $headers = ['Accept: text/plain, application/json'];
 
         // If the URL already carries the token, leave it alone; otherwise send it
-        // as a header so it does not end up in the target's access log.
-        if ($target['token'] !== '' && !preg_match('/[?&]token=/i', $url)) {
+        // as a header so it does not end up in the target's access log. A
+        // `?token=` with nothing after it is where someone means to paste one and
+        // has not: the fallback token still goes in the header, and the target
+        // ignores the empty query parameter.
+        if ($target['token'] !== '' && !preg_match('/[?&]token=[^&]/i', $url)) {
             $headers[] = 'X-Health-Token: ' . $target['token'];
         }
         if ($target['host_header'] !== '') {
@@ -1120,7 +1225,7 @@ if ($opt['only'] !== []) {
 
 if ($targets === []) {
     $msg = $envLoaded
-        ? "No targets configured in $envFile (set TARGET_1_URL, TARGET_2_URL, …)."
+        ? "No targets configured in $envFile (add a TARGET_URL[]= line per instance)."
         : "No .env found at $envFile — copy .env.example and configure the targets.";
     $log->line('error', 'aggregator', $msg);
     if (!$isCli) {
