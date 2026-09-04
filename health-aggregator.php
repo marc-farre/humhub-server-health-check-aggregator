@@ -40,7 +40,7 @@
 
 declare(strict_types=1);
 
-const AGG_VERSION = '1.1.0';
+const AGG_VERSION = '1.1.1';
 
 /** The phrase each per-instance health-check.php prints when it is healthy. */
 const AGG_REMOTE_OK_KEYWORD = 'Server health check passed';
@@ -96,10 +96,17 @@ final class Env
         return $this->vars[$key] ?? null;
     }
 
+    /**
+     * An empty value means "not set", not "set to nothing".
+     *
+     * `LOG_FILE=` with nothing after it is how a commented-out setting usually
+     * ends up looking once someone has edited a `.env`, and reading that as an
+     * empty path rather than as the default is how it turns into a crash.
+     */
     public function str(string $key, string $default = ''): string
     {
         $v = $this->raw($key);
-        return $v === null ? $default : $v;
+        return ($v === null || trim($v) === '') ? $default : $v;
     }
 
     public function bool(string $key, bool $default = false): bool
@@ -325,6 +332,10 @@ final class AggLog
     /** Can this path be appended to? Creates it, with the log's own mode. */
     private function open(string $path): bool
     {
+        // fopen('') is a ValueError, not a false return.
+        if (trim($path) === '') {
+            return false;
+        }
         $handle = @fopen($path, 'ab');
         if ($handle === false) {
             return false;
@@ -334,21 +345,34 @@ final class AggLog
         return true;
     }
 
+    /**
+     * Never throws, whatever the filesystem does.
+     *
+     * The error and exception handlers log through here, so an exception raised
+     * while logging would be raised from inside the handler for the previous
+     * one — turning a single problem into a cascade of fatals and burying the
+     * original cause. Failing to write a log line is not worth an exception.
+     */
     private function append(string $entry): void
     {
-        $path = $this->resolve();
-        if ($path === null) {
-            return;
+        try {
+            $path = $this->resolve();
+            if ($path === null || $path === '') {
+                return;
+            }
+            $this->rotate($path);
+            $handle = @fopen($path, 'ab');
+            if ($handle === false) {
+                return;
+            }
+            @flock($handle, LOCK_EX);
+            @fwrite($handle, $entry);
+            @flock($handle, LOCK_UN);
+            fclose($handle);
+        } catch (Throwable $e) {
+            $this->problem = 'writing to the log failed: ' . $e->getMessage();
+            $this->enabled = false;
         }
-        $this->rotate($path);
-        $handle = @fopen($path, 'ab');
-        if ($handle === false) {
-            return;
-        }
-        @flock($handle, LOCK_EX);
-        @fwrite($handle, $entry);
-        @flock($handle, LOCK_UN);
-        fclose($handle);
     }
 
     /** Keep the log from growing without bound: <file> -> <file>.1 -> … */
@@ -390,6 +414,9 @@ final class AggState
     public function __construct(Env $env, string $dir)
     {
         $this->file = $env->str('STATE_FILE', rtrim($dir, '/') . '/.health-aggregator-state.json');
+        if (trim($this->file) === '') {
+            $this->file = rtrim($dir, '/') . '/.health-aggregator-state.json';
+        }
         $data = null;
         if (is_readable($this->file)) {
             $data = json_decode((string) @file_get_contents($this->file), true);
@@ -421,6 +448,9 @@ final class AggState
 
     public function save(): bool
     {
+        if (trim($this->file) === '') {
+            return false;
+        }
         $json = json_encode($this->data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
         $tmp = $this->file . '.tmp' . getmypid();
         if (@file_put_contents($tmp, $json) === false) {
@@ -916,12 +946,21 @@ set_error_handler(static function (int $no, string $message, string $file = '', 
     if (!(error_reporting() & $no)) {
         return false;
     }
-    $log->line('error', 'php', sprintf('%s in %s:%d', $message, basename($file), $line));
+    try {
+        $log->line('error', 'php', sprintf('%s in %s:%d', $message, basename($file), $line));
+    } catch (Throwable $ignored) {
+    }
     return !$isCli; // over HTTP, swallow it: the body must stay a clean report
 });
 
 set_exception_handler(static function (Throwable $e) use ($log, $isCli): void {
-    $log->line('error', 'php', sprintf('uncaught %s: %s in %s:%d', get_class($e), $e->getMessage(), basename($e->getFile()), $e->getLine()));
+    // The report must survive a broken log: whatever went wrong, the operator
+    // still needs to be told, and on the CLI the message on stderr may be the
+    // only copy they get.
+    try {
+        $log->line('error', 'php', sprintf('uncaught %s: %s in %s:%d', get_class($e), $e->getMessage(), basename($e->getFile()), $e->getLine()));
+    } catch (Throwable $ignored) {
+    }
     if (!$isCli) {
         http_response_code(503);
         echo "ERROR: the aggregator crashed — see the log (?log=50).\n";
@@ -939,7 +978,10 @@ register_shutdown_function(static function () use ($log, $isCli): void {
     if ($fatal === null || !($fatal['type'] & (E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR))) {
         return;
     }
-    $log->line('error', 'php', sprintf('fatal: %s in %s:%d', $fatal['message'], basename((string) $fatal['file']), (int) $fatal['line']));
+    try {
+        $log->line('error', 'php', sprintf('fatal: %s in %s:%d', $fatal['message'], basename((string) $fatal['file']), (int) $fatal['line']));
+    } catch (Throwable $ignored) {
+    }
     if ($isCli) {
         return;
     }
