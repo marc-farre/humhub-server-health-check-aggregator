@@ -16,12 +16,21 @@
  * USAGE
  *   CLI:   php health-aggregator.php [-v] [--json] [--quiet] [--no-color]
  *                                    [--env=/path/.env] [--only=label,label]
+ *                                    [--log[=LINES]] [--log-path] [--clear-log]
  *          Exit codes: 0 = all OK, 1 = warnings only, 2 = at least one failure
  *
  *   HTTP:  https://<host>/health-aggregator/health-aggregator.php?token=SECRET
  *          200 = all passed, 503 = at least one instance failed.
  *          Uptime Kuma: keyword monitor on "All server health checks passed".
  *          Add &format=json for machine-readable output.
+ *          Add &log=200 to read the last 200 log lines instead of running.
+ *
+ * LOG
+ *   Run from a monitor, nobody ever sees the terminal — so every run that is not
+ *   healthy, every state change and every internal error is also appended to a
+ *   log file (LOG_FILE, rotated at LOG_MAX_KB). It is readable over HTTP with
+ *   the same token via ?log=, which is the only way to get at it when the
+ *   aggregator is driven by Uptime Kuma.
  *
  * Configuration lives in a `.env` next to this script; protect it with the
  * bundled .htaccess. Never expose this endpoint without a token: it reveals the
@@ -31,7 +40,7 @@
 
 declare(strict_types=1);
 
-const AGG_VERSION = '1.0.0';
+const AGG_VERSION = '1.1.0';
 
 /** The phrase each per-instance health-check.php prints when it is healthy. */
 const AGG_REMOTE_OK_KEYWORD = 'Server health check passed';
@@ -121,6 +130,308 @@ final class Env
 }
 
 // =============================================================================
+// Log
+// =============================================================================
+
+/**
+ * An append-only log of what the aggregator saw.
+ *
+ * The aggregator normally runs from a monitor, where the response body is the
+ * only thing anyone sees and only for as long as the monitor keeps it. Anything
+ * worth explaining after the fact — a failing instance, an instance that came
+ * back, a slow one, a PHP error, a broken configuration — is therefore also
+ * appended here, and can be read back over HTTP with `?log=`.
+ *
+ * The file is written next to the script by default, where the bundled
+ * .htaccess already denies `.log`. If that directory is not writable by the PHP
+ * user (a very common split between the CLI and web users), the temp directory
+ * is used instead and the fallback is reported rather than silently swallowed.
+ */
+/**
+ * Where to put a file when the script's own directory is not writable.
+ *
+ * The name is tied to the installation directory and the user, so two
+ * aggregators on one host — or a leftover file from an install that has moved —
+ * never read each other's log or state.
+ *
+ * Everything goes inside a 0700 directory we own rather than straight into the
+ * shared temp directory: a predictable name there is a file any local user can
+ * pre-empt with a symlink, and the PHP user would then happily append the log
+ * into whatever it points at. Returns '' when no such directory can be had,
+ * which callers report rather than work around.
+ */
+function agg_fallback_path(string $name): string
+{
+    static $dir = null;
+    if ($dir === null) {
+        $uid = function_exists('posix_geteuid') ? (string) posix_geteuid() : get_current_user();
+        $dir = rtrim(sys_get_temp_dir(), '/') . '/health-aggregator-' . substr(sha1(__DIR__ . '|' . $uid), 0, 12);
+        if (!is_dir($dir) || is_link($dir)) {
+            $dir = @mkdir($dir, 0700, true) ? $dir : '';
+        }
+        if ($dir !== '') {
+            // Someone else's directory at our path is not one we can trust.
+            $owner = @fileowner($dir);
+            if (function_exists('posix_geteuid') && $owner !== false && $owner !== posix_geteuid()) {
+                $dir = '';
+            } else {
+                @chmod($dir, 0700);
+            }
+        }
+    }
+    return $dir === '' ? '' : $dir . '/' . $name;
+}
+
+final class AggLog
+{
+    public const OFF = 'off';
+
+    private string $file;
+    private string $fallback;
+    private string $format;
+    private string $events;
+    private int $maxBytes;
+    private int $keep;
+    private bool $detail;
+    private bool $enabled;
+    private ?string $problem = null;
+    private bool $opened = false;
+
+    public function __construct(Env $env, string $dir)
+    {
+        $this->enabled = $env->bool('LOG_ENABLED', true);
+        $this->file = $env->str('LOG_FILE', rtrim($dir, '/') . '/health-aggregator.log');
+        $this->fallback = agg_fallback_path('health-aggregator.log');
+        $this->format = strtolower($env->str('LOG_FORMAT', 'text')) === 'json' ? 'json' : 'text';
+        $this->events = strtolower($env->str('LOG_EVENTS', 'changes'));
+        if (!in_array($this->events, ['off', 'problems', 'changes', 'all'], true)) {
+            $this->events = 'changes';
+        }
+        $this->maxBytes = max(0, $env->int('LOG_MAX_KB', 1024)) * 1024;
+        $this->keep = max(0, $env->int('LOG_KEEP', 1));
+        $this->detail = $env->bool('LOG_DETAIL', true);
+        if ($this->events === self::OFF) {
+            $this->enabled = false;
+        }
+    }
+
+    public function enabled(): bool
+    {
+        return $this->enabled;
+    }
+
+    public function events(): string
+    {
+        return $this->enabled ? $this->events : self::OFF;
+    }
+
+    public function detail(): bool
+    {
+        return $this->detail;
+    }
+
+    public function file(): string
+    {
+        return $this->file;
+    }
+
+    /** Why logging is not working, or null when it is. */
+    public function problem(): ?string
+    {
+        return $this->problem;
+    }
+
+    /** @param array<string,scalar|null> $context */
+    public function line(string $level, string $target, string $message, array $context = []): void
+    {
+        if (!$this->enabled) {
+            return;
+        }
+        $message = trim(preg_replace('/\s+/', ' ', $message) ?? $message);
+        if ($this->format === 'json') {
+            $entry = json_encode(['ts' => date('c'), 'level' => $level, 'target' => $target, 'message' => $message] + $context, JSON_UNESCAPED_SLASHES);
+        } else {
+            $entry = sprintf('[%s] %-5s %-20s %s', date('Y-m-d H:i:sP'), strtoupper($level), $target, $message);
+        }
+        $this->append((string) $entry . "\n");
+    }
+
+    /** @return string[] the last $lines lines, oldest first */
+    public function tail(int $lines): array
+    {
+        $path = $this->resolve();
+        if ($path === null || !is_readable($path)) {
+            return [];
+        }
+        // Read from the end in chunks: the log may be megabytes and the caller
+        // usually wants the last screenful.
+        $handle = @fopen($path, 'rb');
+        if ($handle === false) {
+            return [];
+        }
+        $size = (int) @filesize($path);
+        $chunk = 8192;
+        $offset = $size;
+        $buffer = '';
+        while ($offset > 0 && substr_count($buffer, "\n") <= $lines) {
+            $read = (int) min($chunk, $offset);
+            $offset -= $read;
+            fseek($handle, $offset);
+            $buffer = (string) fread($handle, $read) . $buffer;
+        }
+        fclose($handle);
+        $buffer = trim($buffer);
+        if ($buffer === '') {
+            return [];
+        }
+        return array_slice(preg_split('/\R/', $buffer) ?: [], -$lines);
+    }
+
+    public function clear(): bool
+    {
+        $path = $this->resolve();
+        return $path !== null && @file_put_contents($path, '') !== false;
+    }
+
+    /** The file actually being written to, or null when logging is off/broken. */
+    public function resolve(): ?string
+    {
+        if (!$this->enabled) {
+            return null;
+        }
+        if ($this->opened) {
+            return $this->file;
+        }
+        $this->opened = true;
+        foreach ([$this->file, $this->fallback] as $candidate) {
+            if ($candidate === '') {
+                continue;
+            }
+            $handle = @fopen($candidate, 'ab');
+            if ($handle !== false) {
+                fclose($handle);
+                if ($candidate !== $this->file) {
+                    $this->problem = sprintf('%s is not writable by the PHP user — logging to %s instead', $this->file, $candidate);
+                    $this->file = $candidate;
+                }
+                @chmod($this->file, 0640);
+                return $this->file;
+            }
+        }
+        $this->problem = sprintf('neither %s nor %s is writable by the PHP user — nothing is being logged', $this->file, $this->fallback);
+        $this->enabled = false;
+        return null;
+    }
+
+    private function append(string $entry): void
+    {
+        $path = $this->resolve();
+        if ($path === null) {
+            return;
+        }
+        $this->rotate($path);
+        $handle = @fopen($path, 'ab');
+        if ($handle === false) {
+            return;
+        }
+        @flock($handle, LOCK_EX);
+        @fwrite($handle, $entry);
+        @flock($handle, LOCK_UN);
+        fclose($handle);
+    }
+
+    /** Keep the log from growing without bound: <file> -> <file>.1 -> … */
+    private function rotate(string $path): void
+    {
+        if ($this->maxBytes <= 0) {
+            return;
+        }
+        clearstatcache(true, $path);
+        if ((int) @filesize($path) < $this->maxBytes) {
+            return;
+        }
+        if ($this->keep === 0) {
+            @file_put_contents($path, '');
+            return;
+        }
+        for ($i = $this->keep; $i >= 1; $i--) {
+            $from = $i === 1 ? $path : $path . '.' . ($i - 1);
+            if (is_file($from)) {
+                @rename($from, $path . '.' . $i);
+            }
+        }
+        // The rotated-in file is created by the next fwrite() and would take the
+        // umask default; the log names instance URLs, so keep it to 0640.
+        @touch($path);
+        @chmod($path, 0640);
+    }
+}
+
+/**
+ * What the previous run saw, so that "instance-two failed" can be logged once
+ * instead of on every poll, and so the log can say how long it has been failing.
+ */
+final class AggState
+{
+    private string $file;
+    private array $data;
+
+    public function __construct(Env $env, string $dir)
+    {
+        $this->file = $env->str('STATE_FILE', rtrim($dir, '/') . '/.health-aggregator-state.json');
+        $data = null;
+        if (is_readable($this->file)) {
+            $data = json_decode((string) @file_get_contents($this->file), true);
+        } else {
+            // Not there, or there but written by the other user — a cron run as
+            // root and a web run as www-data is the common split. Either way this
+            // process cannot use it, so it uses its own copy; reading the primary
+            // and writing the fallback would reset the change detection on every
+            // single poll.
+            $fallback = agg_fallback_path('health-aggregator-state.json');
+            if ($fallback !== '') {
+                $this->file = $fallback;
+                $data = is_readable($fallback) ? json_decode((string) @file_get_contents($fallback), true) : null;
+            }
+        }
+        $this->data = is_array($data) ? $data : [];
+    }
+
+    public function get(string $key, $default = null)
+    {
+        return $this->data[$key] ?? $default;
+    }
+
+    public function set(string $key, $value): void
+    {
+        $this->data[$key] = $value;
+    }
+
+    public function save(): bool
+    {
+        $json = json_encode($this->data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        $tmp = $this->file . '.tmp' . getmypid();
+        if (@file_put_contents($tmp, $json) === false) {
+            $fallback = agg_fallback_path('health-aggregator-state.json');
+            if ($fallback === '' || $this->file === $fallback) {
+                return false;
+            }
+            $this->file = $fallback;
+            $tmp = $this->file . '.tmp' . getmypid();
+            if (@file_put_contents($tmp, $json) === false) {
+                return false;
+            }
+        }
+        @chmod($tmp, 0640);
+        if (!@rename($tmp, $this->file)) {
+            @unlink($tmp);
+            return false;
+        }
+        return true;
+    }
+}
+
+// =============================================================================
 // Helpers
 // =============================================================================
 
@@ -162,13 +473,14 @@ function agg_redact(string $url): string
 /**
  * Read the numbered TARGET_n_* blocks from the .env.
  *
- * @return array<int,array{label:string,url:string,token:string,insecure:bool,host_header:string}>
+ * @return array<int,array{label:string,url:string,token:string,insecure:bool,host_header:string,timeout:int}>
  */
 function agg_targets(Env $env): array
 {
     $targets = [];
     $defaultToken = $env->str('DEFAULT_TOKEN');
     $max = $env->int('MAX_TARGETS', 100);
+    $timeout = $env->int('TIMEOUT', 15);
 
     for ($i = 1; $i <= $max; $i++) {
         $url = trim($env->str("TARGET_{$i}_URL"));
@@ -185,6 +497,9 @@ function agg_targets(Env $env): array
             'token' => $env->str("TARGET_{$i}_TOKEN", $defaultToken),
             'insecure' => $env->bool("TARGET_{$i}_INSECURE", $env->bool('DEFAULT_INSECURE', false)),
             'host_header' => $env->str("TARGET_{$i}_HOST_HEADER"),
+            // One habitually slow instance should not force a longer timeout on
+            // the whole fleet. 0 keeps cURL's meaning of "no timeout".
+            'timeout' => max(0, $env->int("TARGET_{$i}_TIMEOUT", $timeout)),
         ];
     }
 
@@ -192,22 +507,78 @@ function agg_targets(Env $env): array
 }
 
 /**
- * Fetch every target in parallel, so the total time is that of the slowest
+ * A stable key for a cURL handle. PHP 8 hands out CurlHandle objects where PHP 7
+ * used resources, and casting an object to int yields 1 for every handle — which
+ * would map every error onto the same target.
+ *
+ * @param resource|object $handle
+ */
+function agg_curl_id($handle): int
+{
+    return is_object($handle) ? spl_object_id($handle) : (int) $handle;
+}
+
+/**
+ * Fetch every target, retrying the ones that did not answer at all.
+ *
+ * A single dropped connection or a request that arrived while the instance was
+ * busy would otherwise report a healthy server as DOWN. Only transport failures
+ * are retried — an instance that answered with errors answered, and repeating
+ * the question would not change it.
+ *
+ * @param array<int,array{label:string,url:string,token:string,insecure:bool,host_header:string,timeout:int}> $targets
+ * @return array<int,array{body:string,code:int,error:string,time:float,attempts:int}>
+ */
+function agg_fetch_all(array $targets, Env $env, ?AggLog $log = null): array
+{
+    $results = agg_fetch_batch($targets, $env, array_keys($targets));
+    $retries = max(0, $env->int('RETRIES', 1));
+
+    for ($attempt = 1; $attempt <= $retries; $attempt++) {
+        $again = [];
+        foreach ($results as $i => $res) {
+            if ($res['error'] !== '' && trim($res['body']) === '') {
+                $again[] = $i;
+            }
+        }
+        if ($again === []) {
+            break;
+        }
+        $log?->line('info', 'aggregator', sprintf(
+            'retry %d/%d for %d unreachable instance(s): %s',
+            $attempt,
+            $retries,
+            count($again),
+            implode(', ', array_map(static fn(int $i) => $targets[$i]['label'], $again))
+        ));
+        foreach (agg_fetch_batch($targets, $env, $again) as $i => $res) {
+            $res['attempts'] = ($results[$i]['attempts'] ?? 1) + 1;
+            $results[$i] = $res;
+        }
+    }
+
+    return $results;
+}
+
+/**
+ * Fetch the given targets in parallel, so the total time is that of the slowest
  * instance rather than the sum of all of them.
  *
- * @param array<int,array{label:string,url:string,token:string,insecure:bool,host_header:string}> $targets
- * @return array<int,array{body:string,code:int,error:string,time:float}>
+ * @param array<int,array{label:string,url:string,token:string,insecure:bool,host_header:string,timeout:int}> $targets
+ * @param int[] $indices which of them to fetch
+ * @return array<int,array{body:string,code:int,error:string,time:float,attempts:int}>
  */
-function agg_fetch_all(array $targets, Env $env): array
+function agg_fetch_batch(array $targets, Env $env, array $indices): array
 {
-    $timeout = $env->int('TIMEOUT', 15);
     $connectTimeout = $env->int('CONNECT_TIMEOUT', 5);
     $maxBody = $env->int('MAX_RESPONSE_KB', 256) * 1024;
 
     $multi = curl_multi_init();
     $handles = [];
 
-    foreach ($targets as $i => $target) {
+    foreach ($indices as $i) {
+        $target = $targets[$i];
+        $timeout = $target['timeout'];
         $url = $target['url'];
         $headers = ['Accept: text/plain, application/json'];
 
@@ -239,8 +610,10 @@ function agg_fetch_all(array $targets, Env $env): array
 
     do {
         $status = curl_multi_exec($multi, $running);
-        if ($running) {
-            curl_multi_select($multi, 1.0);
+        // -1 means there was nothing to wait on (routine while the threaded
+        // resolver works); without the pause the loop spins at 100% CPU.
+        if ($running && curl_multi_select($multi, 1.0) === -1) {
+            usleep(1000);
         }
     } while ($running > 0 && $status === CURLM_OK);
 
@@ -249,7 +622,7 @@ function agg_fetch_all(array $targets, Env $env): array
     $curlErrors = [];
     while (($msg = curl_multi_info_read($multi)) !== false) {
         if (($msg['result'] ?? CURLE_OK) !== CURLE_OK) {
-            $curlErrors[(int) $msg['handle']] = function_exists('curl_strerror')
+            $curlErrors[agg_curl_id($msg['handle'])] = function_exists('curl_strerror')
                 ? (string) curl_strerror((int) $msg['result'])
                 : 'cURL error ' . (int) $msg['result'];
         }
@@ -259,14 +632,15 @@ function agg_fetch_all(array $targets, Env $env): array
     foreach ($handles as $i => $ch) {
         $body = (string) curl_multi_getcontent($ch);
         $error = (string) curl_error($ch);
-        if ($error === '' && isset($curlErrors[(int) $ch])) {
-            $error = $curlErrors[(int) $ch];
+        if ($error === '' && isset($curlErrors[agg_curl_id($ch)])) {
+            $error = $curlErrors[agg_curl_id($ch)];
         }
         $results[$i] = [
             'body' => strlen($body) > $maxBody ? substr($body, 0, $maxBody) : $body,
             'code' => (int) curl_getinfo($ch, CURLINFO_HTTP_CODE),
             'error' => $error,
             'time' => (float) curl_getinfo($ch, CURLINFO_TOTAL_TIME),
+            'attempts' => 1,
         ];
         curl_multi_remove_handle($multi, $ch);
         curl_close($ch);
@@ -403,7 +777,7 @@ function agg_classify(array $res): array
 
 $isCli = PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg';
 $started = microtime(true);
-$opt = ['verbose' => false, 'quiet' => false, 'json' => false, 'color' => true, 'env' => null, 'only' => []];
+$opt = ['verbose' => false, 'quiet' => false, 'json' => false, 'color' => true, 'env' => null, 'only' => [], 'log' => 0, 'logPath' => false, 'clearLog' => false];
 
 if ($isCli) {
     foreach (array_slice($argv ?? [], 1) as $arg) {
@@ -419,6 +793,14 @@ if ($isCli) {
             $opt['env'] = substr($arg, 6);
         } elseif (str_starts_with($arg, '--only=')) {
             $opt['only'] = array_filter(array_map('trim', explode(',', substr($arg, 7))));
+        } elseif ($arg === '--log') {
+            $opt['log'] = 200;
+        } elseif (str_starts_with($arg, '--log=')) {
+            $opt['log'] = max(1, (int) substr($arg, 6));
+        } elseif ($arg === '--log-path') {
+            $opt['logPath'] = true;
+        } elseif ($arg === '--clear-log') {
+            $opt['clearLog'] = true;
         } elseif ($arg === '-h' || $arg === '--help') {
             fwrite(STDOUT, "HumHub health check aggregator " . AGG_VERSION . "\n\n"
                 . "Usage: php health-aggregator.php [options]\n\n"
@@ -427,7 +809,11 @@ if ($isCli) {
                 . "      --json         JSON output\n"
                 . "      --no-color     disable ANSI colours\n"
                 . "      --env=PATH     path to the .env (default: .env next to this script)\n"
-                . "      --only=LABELS  only check these target labels\n\n"
+                . "      --only=LABELS  only check these target labels\n"
+                . "      --log[=N]      print the last N log lines (default 200) and exit\n"
+                . "      --log-path     print the path of the log file and exit\n"
+                . "      --clear-log    empty the log file and exit\n\n"
+                . "Over HTTP the same log is available as ?log=N with the usual token.\n\n"
                 . "Exit codes: 0 = all passed, 1 = warnings only, 2 = at least one failure\n");
             exit(0);
         }
@@ -437,12 +823,98 @@ if ($isCli) {
     $opt['json'] = (($_GET['format'] ?? '') === 'json');
     $opt['verbose'] = isset($_GET['verbose']);
     $opt['color'] = false;
+    // A stray or malformed `log` parameter must never quietly turn the monitor
+    // endpoint into a log view: that would answer 200 with a body which cannot
+    // contain the keyword, and the monitor would report the fleet as broken.
+    if (isset($_GET['log'])) {
+        $raw = strtolower(trim((string) $_GET['log']));
+        if ($raw === '' || in_array($raw, ['1', 'true', 'yes', 'on'], true)) {
+            $opt['log'] = 200;
+        } elseif (ctype_digit($raw) && (int) $raw > 0) {
+            $opt['log'] = min((int) $raw, 5000);
+        }
+    }
 }
 
 $env = new Env();
 $envFile = $opt['env'] ?? (__DIR__ . '/.env');
 $envExists = is_file($envFile);
 $envLoaded = $env->load($envFile);
+
+$log = new AggLog($env, __DIR__);
+
+// The response body must stay a clean report: PHP's own error output would end
+// up inside it, in front of the headline a keyword monitor reads. Errors are not
+// lost — the handlers below put them in the log instead.
+if (!$isCli) {
+    @ini_set('display_errors', '0');
+}
+
+// -----------------------------------------------------------------------------
+// Everything PHP itself complains about goes to the log as well
+// -----------------------------------------------------------------------------
+// Run from a monitor there is no terminal to print to and no PHP error log worth
+// finding, so a notice about a malformed .env or a fatal in the middle of a run
+// would simply vanish. On the CLI the message is still shown as before.
+set_error_handler(static function (int $no, string $message, string $file = '', int $line = 0) use ($log, $isCli): bool {
+    if (!(error_reporting() & $no)) {
+        return false;
+    }
+    $log->line('error', 'php', sprintf('%s in %s:%d', $message, basename($file), $line));
+    return !$isCli; // over HTTP, swallow it: the body must stay a clean report
+});
+
+set_exception_handler(static function (Throwable $e) use ($log, $isCli): void {
+    $log->line('error', 'php', sprintf('uncaught %s: %s in %s:%d', get_class($e), $e->getMessage(), basename($e->getFile()), $e->getLine()));
+    if (!$isCli) {
+        http_response_code(503);
+        echo "ERROR: the aggregator crashed — see the log (?log=50).\n";
+    } else {
+        fwrite(STDERR, 'ERROR: ' . $e->getMessage() . "\n");
+    }
+    exit(2);
+});
+
+// A real fatal — out of memory, max_execution_time, a call into something that
+// is not there — never reaches the exception handler, so the clean failure
+// response has to be produced here as well.
+register_shutdown_function(static function () use ($log, $isCli): void {
+    $fatal = error_get_last();
+    if ($fatal === null || !($fatal['type'] & (E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR))) {
+        return;
+    }
+    $log->line('error', 'php', sprintf('fatal: %s in %s:%d', $fatal['message'], basename((string) $fatal['file']), (int) $fatal['line']));
+    if ($isCli) {
+        return;
+    }
+    if (!headers_sent()) {
+        http_response_code(503);
+    }
+    echo "\nERROR: the aggregator crashed — see the log (?log=50).\n";
+});
+
+// -----------------------------------------------------------------------------
+// Log inspection (CLI) — the HTTP equivalent lives behind the token gate below
+// -----------------------------------------------------------------------------
+if ($isCli && ($opt['logPath'] || $opt['clearLog'] || $opt['log'] > 0)) {
+    $path = $log->resolve();
+    if ($path === null) {
+        fwrite(STDERR, 'No log available: ' . ($log->problem() ?? 'logging is disabled (LOG_ENABLED=false or LOG_EVENTS=off)') . "\n");
+        exit(2);
+    }
+    if ($opt['logPath']) {
+        fwrite(STDOUT, $path . "\n");
+        exit(0);
+    }
+    if ($opt['clearLog']) {
+        $ok = $log->clear();
+        fwrite($ok ? STDOUT : STDERR, ($ok ? 'Cleared ' : 'Could not clear ') . $path . "\n");
+        exit($ok ? 0 : 2);
+    }
+    $lines = $log->tail($opt['log']);
+    fwrite(STDOUT, $lines === [] ? "(log is empty: $path)\n" : implode("\n", $lines) . "\n");
+    exit(0);
+}
 
 // -----------------------------------------------------------------------------
 // HTTP gate — fail closed, exactly like health-check.php
@@ -496,12 +968,45 @@ if (!$isCli) {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Log inspection over HTTP — same token, no separate secret to keep
+// -----------------------------------------------------------------------------
+// This is the whole point of the log for anyone driving the aggregator from
+// Uptime Kuma: the run itself is invisible, so the record of it has to be
+// reachable with a browser.
+if (!$isCli && $opt['log'] > 0) {
+    if (!$env->bool('LOG_VIEW', true)) {
+        http_response_code(403);
+        echo "Forbidden: reading the log over HTTP is disabled (LOG_VIEW=false).\n";
+        exit(1);
+    }
+    $path = $log->resolve();
+    $lines = $path === null ? [] : $log->tail($opt['log']);
+    if ($opt['json']) {
+        echo json_encode([
+            'status' => $path === null ? 'error' : 'ok',
+            'log_file' => $path,
+            'message' => $path === null ? ($log->problem() ?? 'logging is disabled') : null,
+            'lines' => $lines,
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+        exit(0);
+    }
+    if ($path === null) {
+        echo 'No log available: ' . ($log->problem() ?? 'logging is disabled (LOG_ENABLED=false or LOG_EVENTS=off)') . "\n";
+        exit(0);
+    }
+    printf("%s — last %d line(s)\n\n", $path, count($lines));
+    echo $lines === [] ? "(empty — nothing worth logging has happened yet)\n" : implode("\n", $lines) . "\n";
+    exit(0);
+}
+
 // =============================================================================
 // Run
 // =============================================================================
 
 if (!function_exists('curl_multi_init')) {
     $msg = 'The cURL extension is required by the aggregator.';
+    $log->line('error', 'aggregator', $msg);
     if (!$isCli) {
         http_response_code(503);
     }
@@ -519,6 +1024,7 @@ if ($targets === []) {
     $msg = $envLoaded
         ? "No targets configured in $envFile (set TARGET_1_URL, TARGET_2_URL, …)."
         : "No .env found at $envFile — copy .env.example and configure the targets.";
+    $log->line('error', 'aggregator', $msg);
     if (!$isCli) {
         http_response_code(503);
     }
@@ -526,11 +1032,13 @@ if ($targets === []) {
     exit(2);
 }
 
-$responses = agg_fetch_all($targets, $env);
+$responses = agg_fetch_all($targets, $env, $log);
 
+$slowMs = $env->int('SLOW_MS', 5000);
 $results = [];
 foreach ($targets as $i => $target) {
     $verdict = agg_classify($responses[$i]);
+    $timeMs = (int) round($responses[$i]['time'] * 1000);
     $results[] = [
         'label' => $target['label'],
         'url' => agg_redact($target['url']),
@@ -539,7 +1047,11 @@ foreach ($targets as $i => $target) {
         'errors' => $verdict['errors'],
         'warnings' => $verdict['warnings'],
         'http_code' => $responses[$i]['code'],
-        'time_ms' => (int) round($responses[$i]['time'] * 1000),
+        'time_ms' => $timeMs,
+        'attempts' => (int) ($responses[$i]['attempts'] ?? 1),
+        // An instance creeping towards the timeout is worth knowing about before
+        // it crosses it and starts being reported as down.
+        'slow' => $slowMs > 0 && $timeMs >= $slowMs,
     ];
 }
 
@@ -549,10 +1061,7 @@ $warned = array_values(array_filter($results, static fn($r) => $r['state'] === '
 $passed = array_values(array_filter($results, static fn($r) => in_array($r['state'], ['OK', 'WARN'], true)));
 $isFailure = $failed !== [] || ($failOnWarning && $warned !== []);
 $duration = microtime(true) - $started;
-
-// =============================================================================
-// Output
-// =============================================================================
+$status = $isFailure ? 'error' : ($warned !== [] ? 'warning' : 'ok');
 
 // The keyword must appear ONLY when every instance is healthy, so Uptime Kuma
 // can key on it. On failure the phrase is absent from the whole response.
@@ -562,13 +1071,129 @@ $headline = $isFailure
         ? AGG_OK_KEYWORD
         : AGG_OK_KEYWORD . sprintf(' (%d instance(s) with warnings)', count($warned)));
 
+// =============================================================================
+// Log the run
+// =============================================================================
+// What gets written is governed by LOG_EVENTS:
+//   all       every run
+//   changes   every run that is not healthy, plus the run that recovers, plus a
+//             reminder every LOG_REPEAT_MINUTES while a problem persists
+//   problems  the same, minus the recovery line
+//   off       nothing
+// The point is a log that is worth reading: a monitor polling every 60 seconds
+// would otherwise bury a real incident under thousands of identical lines.
+
+if ($log->enabled()) {
+    // Resolved unconditionally, not just when something is written: otherwise a
+    // log that cannot be written to stays undetected on exactly the healthy runs
+    // that write nothing, and the NOTE in the output below never appears.
+    $log->resolve();
+    $state = new AggState($env, __DIR__);
+    $previous = is_array($state->get('instances')) ? $state->get('instances') : [];
+    $now = time();
+
+    $current = [];
+    $changes = [];
+    foreach ($results as $r) {
+        $was = is_array($previous[$r['label']] ?? null) ? $previous[$r['label']] : null;
+        $changed = $was === null ? false : (string) $was['state'] !== $r['state'];
+        $current[$r['label']] = [
+            'state' => $r['state'],
+            'since' => $changed || $was === null ? $now : (int) ($was['since'] ?? $now),
+        ];
+        if ($changed) {
+            $changes[] = sprintf('%s %s -> %s', $r['label'], $was['state'], $r['state']);
+        }
+    }
+    // An instance that disappeared from the configuration is a change too.
+    foreach ($previous as $label => $was) {
+        if (!isset($current[$label])) {
+            $changes[] = sprintf('%s %s -> no longer configured', $label, is_array($was) ? (string) $was['state'] : '?');
+        }
+    }
+
+    $lastStatus = (string) $state->get('status', '');
+    $lastLogged = (int) $state->get('logged_at', 0);
+    $repeatAfter = max(0, $env->int('LOG_REPEAT_MINUTES', 60)) * 60;
+    $statusChanged = $lastStatus !== '' && $lastStatus !== $status;
+
+    $shouldLog = $log->events() === 'all'
+        || $changes !== []
+        || $statusChanged
+        || ($status !== 'ok' && ($repeatAfter === 0 || $now - $lastLogged >= $repeatAfter))
+        || ($lastStatus === '' && $status !== 'ok');
+    // `problems` differs from `changes` in exactly one way: it does not write the
+    // line that says everything is fine again.
+    if ($log->events() === 'problems' && $status === 'ok') {
+        $shouldLog = false;
+    }
+
+    if ($shouldLog) {
+        $level = $isFailure ? 'error' : ($warned !== [] ? 'warn' : 'info');
+        $log->line($level, 'aggregator', sprintf(
+            '%s | %d instance(s): %d ok, %d with warnings, %d failed | %.2fs%s',
+            $headline ?? '',
+            count($results),
+            count($passed) - count($warned),
+            count($warned),
+            count($failed),
+            $duration,
+            $changes === [] ? '' : ' | changed: ' . implode(', ', $changes)
+        ));
+
+        foreach ($results as $r) {
+            $noteworthy = in_array($r['state'], ['FAIL', 'DOWN'], true)
+                || ($r['state'] === 'WARN' && $log->detail())
+                || $r['slow']
+                || $r['attempts'] > 1;
+            if (!$noteworthy && $log->events() !== 'all') {
+                continue;
+            }
+            $since = (int) $current[$r['label']]['since'];
+            $log->line(
+                in_array($r['state'], ['FAIL', 'DOWN'], true) ? 'error' : ($r['state'] === 'WARN' ? 'warn' : 'info'),
+                $r['label'],
+                sprintf(
+                    '%s %s (%dms%s%s)%s %s',
+                    $r['state'],
+                    $r['summary'],
+                    $r['time_ms'],
+                    $r['attempts'] > 1 ? ', ' . $r['attempts'] . ' attempts' : '',
+                    $r['slow'] ? ', slow' : '',
+                    $r['state'] === 'OK' || $since >= $now ? '' : sprintf(' since %s', date('Y-m-d H:i', $since)),
+                    $r['url']
+                )
+            );
+            if (!$log->detail()) {
+                continue;
+            }
+            foreach ($r['errors'] as $entry) {
+                $log->line('error', $r['label'], '  ' . $entry['message']);
+            }
+            foreach ($r['warnings'] as $entry) {
+                $log->line('warn', $r['label'], '  ' . $entry['message']);
+            }
+        }
+        $state->set('logged_at', $now);
+    }
+
+    $state->set('status', $status);
+    $state->set('instances', $current);
+    $state->set('checked_at', $now);
+    $state->save();
+}
+
+// =============================================================================
+// Output
+// =============================================================================
+
 if (!$isCli) {
     http_response_code($isFailure ? 503 : 200);
 }
 
 if ($opt['json']) {
     echo json_encode([
-        'status' => $isFailure ? 'error' : ($warned !== [] ? 'warning' : 'ok'),
+        'status' => $status,
         'headline' => $headline,
         'summary' => [
             'total' => count($results),
@@ -578,6 +1203,8 @@ if ($opt['json']) {
         ],
         'duration_ms' => (int) round($duration * 1000),
         'aggregator_version' => AGG_VERSION,
+        'log_file' => $log->resolve(),
+        'log_problem' => $log->problem(),
         'instances' => $results,
     ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
     exit($isFailure ? 2 : ($warned !== [] ? 1 : 0));
@@ -614,11 +1241,15 @@ usort($results, static function (array $a, array $b): int {
 
 foreach ($results as $r) {
     printf(
-        "%s %-24s %s (%dms)\n",
+        "%s %-24s %s (%dms%s%s)\n",
         $paint(str_pad($r['state'], 4), $r['state']),
         $r['label'],
         $r['summary'] !== '' ? $r['summary'] : $r['url'],
-        $r['time_ms']
+        $r['time_ms'],
+        // Both are worth seeing in the alert itself: they are the early warning
+        // that an instance is on its way to being reported as down.
+        $r['slow'] ? ', slow' : '',
+        $r['attempts'] > 1 ? ', ' . $r['attempts'] . ' attempts' : ''
     );
 
     if (in_array($r['state'], ['FAIL', 'DOWN'], true) || $opt['verbose']) {
@@ -646,6 +1277,14 @@ foreach ($results as $r) {
     if (count($detail) > count($shown)) {
         printf("     … and %d more (open %s for the full report)\n", count($detail) - count($shown), $r['url']);
     }
+}
+
+// A log nobody can write to is worse than no log, because it is silent — so say
+// so in the response itself, which is the one place that is always read.
+if ($log->problem() !== null) {
+    printf("\nNOTE %s\n", $log->problem());
+} elseif ($opt['verbose'] && $log->resolve() !== null) {
+    printf("\nlog: %s\n", $log->resolve());
 }
 
 exit($isFailure ? 2 : ($warned !== [] ? 1 : 0));

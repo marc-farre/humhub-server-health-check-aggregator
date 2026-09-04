@@ -76,7 +76,7 @@ One monitor covers the fleet:
 | Method | `GET` |
 | Body / Body Encoding | leave empty (the encoding dropdown is irrelevant for GET) |
 | Accepted Status Codes | `200-299` |
-| Request Timeout | above the aggregator's `TIMEOUT` (default 15 s) |
+| Request Timeout | above `TIMEOUT × (RETRIES + 1)` — 30 s with the defaults |
 
 Putting the token in the URL is the simplest option. To keep it out of the URL
 field, leave it off and add a header under **HTTP Options → Headers**:
@@ -90,6 +90,87 @@ before PHP sees it — if a Bearer token gives 403, use `X-Health-Token` instead
 
 Instances that only have warnings still count as passed, so warnings do not page
 you. Set `FAIL_ON_WARNING=true` if you would rather be told.
+
+## Logs
+
+Driven by a monitor, the response body is the only thing anyone ever sees — and
+only for as long as Uptime Kuma keeps it. So every run that is not healthy,
+every state change, and every PHP error the aggregator itself hits is appended
+to a log file, and that log is readable **over HTTP with the same token**:
+
+```bash
+curl -s "https://monitor.example.org/health-aggregator/health-aggregator.php?token=…&log=100"
+```
+
+```
+/var/www/health-aggregator/health-aggregator.log — last 5 line(s)
+
+[2026-05-03 09:19:39+02:00] ERROR aggregator  1 of 2 server health check(s) FAILED | 2 instance(s): 1 ok, 0 with warnings, 1 failed | 0.28s | changed: two OK -> FAIL
+[2026-05-03 09:19:39+02:00] ERROR two         FAIL 2 error(s), 1 warning(s) (151ms) https://two.example.org/…
+[2026-05-03 09:19:39+02:00] ERROR two           [app_permissions] HumHub directories are not writable: uploads/file …
+[2026-05-03 09:20:41+02:00] ERROR two         DOWN unreachable: Operation timed out (3002ms, 2 attempts) since 2026-05-03 09:19 https://two.example.org/…
+[2026-05-03 09:24:11+02:00] INFO  aggregator  All server health checks passed | 2 instance(s): 2 ok, 0 with warnings, 0 failed | 0.31s | changed: two DOWN -> OK
+```
+
+`&format=json` returns the same lines as a JSON array. On the command line:
+
+```bash
+php health-aggregator.php --log=100     # last 100 lines
+php health-aggregator.php --log-path    # where the log actually is
+php health-aggregator.php --clear-log
+```
+
+**A monitor polls constantly, so the log records events rather than runs.** With
+the default `LOG_EVENTS=changes` a line is written when an instance changes
+state (in either direction), when the overall verdict changes, and once every
+`LOG_REPEAT_MINUTES` (default 60) while a problem persists — not once a minute
+for the whole outage. Each failing line carries a `since` timestamp, so how long
+it has been broken is in the log itself.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `LOG_ENABLED` | `true` | Master switch. |
+| `LOG_FILE` | `health-aggregator.log` next to the script | Falls back to the temp directory if that path is not writable — and says so in the response body, because a silent log is worse than none. |
+| `LOG_EVENTS` | `changes` | `all` (every run), `changes`, `problems` (as `changes` but no recovery line), `off`. |
+| `LOG_FORMAT` | `text` | `json` writes one JSON object per line. |
+| `LOG_DETAIL` | `true` | Include each instance's individual error and warning lines. |
+| `LOG_REPEAT_MINUTES` | `60` | How often an unchanged problem is repeated. `0` = every run. |
+| `LOG_MAX_KB` | `1024` | Rotates to `<file>.1` above this size. |
+| `LOG_KEEP` | `1` | How many rotated files to keep. |
+| `LOG_VIEW` | `true` | Set `false` to disable reading the log over HTTP. |
+| `STATE_FILE` | `.health-aggregator-state.json` next to the script | Remembers the previous run, for change detection and `since`. |
+
+The bundled `.htaccess` already denies `.log` and dotfiles. On nginx, add the log
+to the deny rule yourself:
+
+```nginx
+location ~ ^/health-aggregator/(?!health-aggregator\.php$) { deny all; }
+```
+
+A PHP error or a crash is logged too, and over HTTP it no longer leaks into the
+response: `display_errors` is forced off for the web SAPI, so the body stays a
+clean `ERROR: the aggregator crashed — see the log (?log=50).` with a 5xx status
+(503, or PHP's own 500 on a true fatal such as an out-of-memory). The keyword
+monitor fails as it should, and the reason is one URL away instead of buried in
+a PHP error log you would have to find first.
+
+## Slow instances
+
+An instance that answers late is reported as `DOWN` once it crosses `TIMEOUT`,
+which makes the run before that — the one where it was merely slow — the useful
+warning. Instances slower than `SLOW_MS` (default 5000) are marked in both the
+output and the log:
+
+```
+OK   instance-two             healthy (4001ms, slow)
+```
+
+Transport failures are retried `RETRIES` times (default `1`) before an instance
+is called down, so a single dropped connection does not page you. Only failures
+to *answer* are retried — an instance that reported errors reported them. Worst
+case the run takes `TIMEOUT × (RETRIES + 1)`, so keep the Uptime Kuma request
+timeout above that. `TARGET_n_TIMEOUT` overrides `TIMEOUT` for one instance,
+which beats raising it for the whole fleet because of one slow server.
 
 ### Getting a 403?
 
@@ -126,7 +207,7 @@ IP it actually saw, so you can copy it from there.
 |---|---|
 | Body contains `Server health check passed` | `OK`, or `WARN` if it also lists warnings |
 | Body contains `Server health check FAILED` | `FAIL`, with the remote `ERROR:` lines |
-| Connection refused, DNS failure, TLS error, timeout | `DOWN` with the cURL reason |
+| Connection refused, DNS failure, TLS error, timeout | `DOWN` with the cURL reason, after `RETRIES` further attempts |
 | HTTP 403 (wrong or missing token) | `DOWN` — misconfiguration, not silence |
 | Anything else answering (maintenance page, WAF, PHP fatal, wrong URL) | `DOWN` with a 200-character excerpt |
 
@@ -176,6 +257,7 @@ no monitor.
 ```
 php health-aggregator.php [-v] [--json] [--quiet] [--no-color]
                           [--env=/path/.env] [--only=label,label]
+                          [--log[=LINES]] [--log-path] [--clear-log]
 ```
 
 Exit codes: `0` = all passed, `1` = warnings only, `2` = at least one failure —
